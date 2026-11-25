@@ -1,0 +1,158 @@
+# geovpn-stage1b-v3: сборка AmneziaWG для N30 Pro (PG33N30P), OpenWrt 25.12.6 mediatek/filogic.
+# Файл кладётся в репозиторий как .github/workflows/build-awg.yml. Запуск — вручную (Actions → Run workflow).
+# Сторонних actions нет: всё делается командами на раннере; результат публикуется через gh (GITHUB_TOKEN).
+# Исходники: модуль и утилиты — официальные репозитории amnezia-vpn, закреплены SHA коммитов;
+# описания пакетов OpenWrt (Makefile, netifd-скрипт) — форк Slava-Shchipunov/awg-openwrt, закреплён SHA коммита.
+name: build-awg
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write   # только для создания релиза с результатами
+
+defaults:
+  run:
+    shell: bash     # GitHub запускает это как «bash --noprofile --norc -eo pipefail»: ошибка в любом звене конвейера — провал шага
+
+env:
+  OWRT_VER: "25.12.6"
+  TARGET: "mediatek"
+  SUBTARGET: "filogic"
+  EXPECT_KERNEL: "6.12.112"
+  EXPECT_KHASH: "f0a7348f9cb959e1bf4d0447669b031e"   # vermagic-хеш ядра роутера (путь kmods на роутере)
+  EXPECT_ARCH: "aarch64_cortex-a53"
+  # Открытый ключ выпуска OpenWrt 25.12 — скопирован с роутера (/etc/apk/keys/openwrt-25.12.pem), SHA-256 файла с роутера:
+  OWRT_KEY_SHA256: "27d61d827d64ccf2f46dce5f52aec6279404d4a00686dafb22f52f3b4ee675f8"
+  FORK_REPO: "https://github.com/Slava-Shchipunov/awg-openwrt.git"
+  FORK_SHA: "03b62269e2edc168504f057cffaafda11b25ed92"   # 2026-09-22 «feat: add awg v3.1 support (#172)»
+  KMOD_REPO: "https://github.com/amnezia-vpn/amneziawg-linux-kernel-module.git"
+  KMOD_VER: "3.1.20261113.02"                             # = версия модуля на SFR с 25.11 (тег v3.1.20261113-02; дефис заменён точкой — формат версии apk)
+  KMOD_SHA: "63ed35de3d3f135b17e8eae0b84949e7700303be"   # тег v3.1.20261113-02
+  TOOLS_REPO: "https://github.com/amnezia-vpn/amneziawg-tools.git"
+  TOOLS_VER: "3.1.20260812"                               # = версия amneziawg-tools на SFR (последний тег утилит)
+  TOOLS_SHA: "ee0f0a9aa34ff0a0da4b3433b9512781cfe02843"  # тег v3.1.20260812
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Host packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential clang flex bison g++ gawk gettext git \
+            libncurses-dev libssl-dev python3 python3-setuptools rsync swig unzip zlib1g-dev file wget zstd openssl
+          uname -a; lsb_release -a || true; echo "ImageVersion=${ImageVersion:-?}"; gcc --version | head -1
+
+      - name: SDK (подпись sha256sums ключом 25.12 с роутера, имя SDK из sha256sums, проверка SHA-256)
+        run: |
+          mkdir -p out
+          cat > owrt-25.12.pem <<'EOF'
+          -----BEGIN PUBLIC KEY-----
+          MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAECqruC4JU7pfpnkQuueBaT29I1dFx
+          Xbc7xYsY5R2+r3Hg3SO3B2QLpMaghA9Uzx/E2PGaNkYe24uPPg/n7Q9Jeg==
+          -----END PUBLIC KEY-----
+          EOF
+          sed -i 's/^ *//' owrt-25.12.pem
+          echo "${OWRT_KEY_SHA256}  owrt-25.12.pem" | sha256sum -c -
+          BASE="https://downloads.openwrt.org/releases/${OWRT_VER}/targets/${TARGET}/${SUBTARGET}"
+          curl -fsS --proto '=https' --tlsv1.2 -o sha256sums "$BASE/sha256sums"
+          curl -fsS --proto '=https' --tlsv1.2 -o sha256sums.sig "$BASE/sha256sums.sig"
+          if openssl dgst -sha256 -verify owrt-25.12.pem -signature sha256sums.sig sha256sums; then
+            echo "SIG=sha256sums.sig проверена ключом 25.12 (OK)" | tee -a "$GITHUB_ENV"
+          else
+            echo "ПОДПИСЬ sha256sums НЕ ПОДТВЕРЖДЕНА — сборка остановлена"; ls -l sha256sums.sig; od -An -tx1 -N 32 sha256sums.sig; exit 1
+          fi
+          grep -E ' \*openwrt-sdk-[^ ]+\.Linux-x86_64\.tar\.zst$' sha256sums > sdk.sum
+          n=$(wc -l < sdk.sum); [ "$n" -eq 1 ] || { echo "ожидалась ровно одна строка SDK, найдено $n"; cat sdk.sum; exit 1; }
+          SDK=$(sed 's/^[0-9a-f]* \*//' sdk.sum); echo "SDK=$SDK" | tee -a "$GITHUB_ENV"
+          echo "SDK_SHA256=$(cut -d' ' -f1 sdk.sum)" | tee -a "$GITHUB_ENV"
+          curl -fsS --proto '=https' --tlsv1.2 -o "$SDK" "$BASE/$SDK"
+          sed 's/ \*/  /' sdk.sum | sha256sum -c -
+          mkdir sdk && tar --zstd -xf "$SDK" -C sdk --strip-components=1
+          rm -f "$SDK"; ls sdk
+
+      - name: Описания пакетов (форк, закреплённый SHA) и закрепление официальных исходников
+        run: |
+          git clone --no-checkout "$FORK_REPO" fork
+          git -C fork checkout --detach "$FORK_SHA"
+          [ "$(git -C fork rev-parse HEAD)" = "$FORK_SHA" ] || { echo "SHA форка не совпал"; exit 1; }
+          # Пакеты — прямо в sdk/package/<имя>, цели сборки: package/<имя>/compile
+          cp -r fork/kmod-amneziawg fork/amneziawg-tools sdk/package/
+          cd sdk/package
+          cp kmod-amneziawg/Makefile kmod.orig; cp amneziawg-tools/Makefile tools.orig
+          sed -i -e "s/^PKG_VERSION:=.*/PKG_VERSION:=${KMOD_VER}/" -e "s/^PKG_SOURCE_VERSION:=.*/PKG_SOURCE_VERSION:=${KMOD_SHA}/" kmod-amneziawg/Makefile
+          sed -i -e "s/^PKG_VERSION:=.*/PKG_VERSION:=${TOOLS_VER}/" -e "s/^PKG_SOURCE_VERSION:=.*/PKG_SOURCE_VERSION:=${TOOLS_SHA}/" amneziawg-tools/Makefile
+          grep -qFx "PKG_SOURCE_URL:=${KMOD_REPO}" kmod-amneziawg/Makefile || { echo "источник модуля не официальный"; exit 1; }
+          grep -qFx "PKG_SOURCE_URL:=${TOOLS_REPO}" amneziawg-tools/Makefile || { echo "источник утилит не официальный"; exit 1; }
+          grep -qFx "PKG_SOURCE_VERSION:=${KMOD_SHA}" kmod-amneziawg/Makefile || { echo "SHA модуля не закреплён"; exit 1; }
+          grep -qFx "PKG_SOURCE_VERSION:=${TOOLS_SHA}" amneziawg-tools/Makefile || { echo "SHA утилит не закреплён"; exit 1; }
+          echo "== изменения Makefile относительно форка:"; diff kmod.orig kmod-amneziawg/Makefile || true; diff tools.orig amneziawg-tools/Makefile || true
+          rm kmod.orig tools.orig
+          echo "== полный текст описаний пакетов (для аудита журнала):"
+          for f in kmod-amneziawg/Makefile amneziawg-tools/Makefile; do echo "----- $f"; cat "$f"; done
+          echo "----- файлы пакета утилит:"; find amneziawg-tools -type f | sort
+          while IFS= read -r f; do echo "----- $f"; cat "$f"; done < <(find amneziawg-tools/files -type f | sort)
+
+      - name: Сборка
+        run: |
+          cd sdk
+          echo "== feeds.conf.default:"; cat feeds.conf.default | tee ../out/feeds.conf.default
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+          { for d in feeds/*/; do [ -d "$d/.git" ] && echo "$(basename "$d") $(git -C "$d" rev-parse HEAD)"; done; } | tee ../out/feeds-revs.txt
+          make defconfig
+          make package/kmod-amneziawg/compile V=s -j"$(nproc)"
+          make package/amneziawg-tools/compile V=s -j"$(nproc)"
+
+      - name: Проверка результата
+        run: |
+          cd sdk
+          find bin -type f -name '*amneziawg*.apk' -exec cp {} ../out/ \;
+          ls -l ../out
+          K=$(ls ../out/kmod-amneziawg*.apk); T=$(ls ../out/amneziawg-tools*.apk)
+          [ "$(echo "$K" | wc -l)" -eq 1 ] && [ "$(echo "$T" | wc -l)" -eq 1 ] || { echo "ожидалось по одному пакету"; exit 1; }
+          APK=./staging_dir/host/bin/apk
+          "$APK" adbdump "$K" > ../out/kmod-meta.txt; cat ../out/kmod-meta.txt
+          "$APK" adbdump "$T" > ../out/tools-meta.txt; cat ../out/tools-meta.txt
+          grep -q "kernel.*${EXPECT_KHASH}" ../out/kmod-meta.txt || { echo "зависимость kmod от ядра не содержит ${EXPECT_KHASH}"; exit 1; }
+          for m in kmod tools; do
+            grep -Eq "arch: *${EXPECT_ARCH}" "../out/${m}-meta.txt" || { echo "${m}: архитектура не ${EXPECT_ARCH}"; exit 1; }
+          done
+          grep -Eq "version: *${KMOD_VER//./\\.}" ../out/kmod-meta.txt || { echo "kmod: версия не ${KMOD_VER}"; exit 1; }
+          grep -Eq "version: *${TOOLS_VER//./\\.}" ../out/tools-meta.txt || { echo "tools: версия не ${TOOLS_VER}"; exit 1; }
+          mkdir x && "$APK" extract --allow-untrusted --destination x "$K"
+          KO=$(find x -name 'amneziawg.ko'); [ -n "$KO" ] || { echo "нет amneziawg.ko"; exit 1; }
+          file "$KO" > ../out/ko-file.txt; cat ../out/ko-file.txt; grep -q 'ARM aarch64' ../out/ko-file.txt
+          VM=$(strings "$KO" | sed -n 's/^vermagic=//p' | head -1); echo "vermagic=$VM" > ../out/ko-vermagic.txt; cat ../out/ko-vermagic.txt
+          case "$VM" in "${EXPECT_KERNEL} "*) ;; *) echo "vermagic не ${EXPECT_KERNEL}"; exit 1 ;; esac
+          mkdir y && "$APK" extract --allow-untrusted --destination y "$T"
+          for f in usr/bin/awg usr/bin/amneziawg_watchdog lib/netifd/proto/amneziawg.sh; do
+            [ -f "y/$f" ] || { echo "в пакете утилит нет /$f"; exit 1; }
+          done
+          ( cd y && find . -type f | sort ) > ../out/tools-files.txt; cat ../out/tools-files.txt
+          file y/usr/bin/awg > ../out/awg-file.txt; cat ../out/awg-file.txt; grep -q 'ARM aarch64' ../out/awg-file.txt
+          cd ../out
+          {
+            echo "OpenWrt ${OWRT_VER} ${TARGET}/${SUBTARGET}"
+            echo "SDK ${SDK} sha256 ${SDK_SHA256}; ${SIG}"
+            echo "feeds:"; cat feeds-revs.txt
+            echo "fork ${FORK_REPO} ${FORK_SHA}"
+            echo "kmod ${KMOD_REPO} ${KMOD_VER} ${KMOD_SHA}"
+            echo "tools ${TOOLS_REPO} ${TOOLS_VER} ${TOOLS_SHA}"
+            echo "expected kernel ${EXPECT_KERNEL} hash ${EXPECT_KHASH}, arch ${EXPECT_ARCH}; ko $(cat ko-vermagic.txt)"
+            echo "runner image ${ImageVersion:-?}"
+            echo "run ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          } > BUILDINFO.txt
+          sha256sum *.apk > SHA256SUMS
+          cat BUILDINFO.txt SHA256SUMS
+
+      - name: Публикация (релиз в этом репозитории)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="awg-${KMOD_VER}-owrt-${OWRT_VER}-run${GITHUB_RUN_ID}"
+          cd out
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --notes-file BUILDINFO.txt \
+            *.apk SHA256SUMS BUILDINFO.txt kmod-meta.txt tools-meta.txt tools-files.txt ko-file.txt ko-vermagic.txt awg-file.txt feeds.conf.default feeds-revs.txt
