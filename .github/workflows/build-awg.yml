@@ -135,17 +135,37 @@ jobs:
           APK=./staging_dir/host/bin/apk
           "$APK" adbdump "$K" > ../out/kmod-meta.txt; cat ../out/kmod-meta.txt
           "$APK" adbdump "$T" > ../out/tools-meta.txt; cat ../out/tools-meta.txt
-          grep -q "kernel.*${EXPECT_KHASH}" ../out/kmod-meta.txt || { echo "зависимость kmod от ядра не содержит ${EXPECT_KHASH}"; exit 1; }
+          KRE="${EXPECT_KERNEL//./\\.}"
+          # точные строки метаданных (-x): зависимость от ядра, архитектура, версии
+          grep -Eqx " *- kernel=${KRE}~${EXPECT_KHASH}-r[0-9]+" ../out/kmod-meta.txt || { echo "kmod: зависимость от ядра не ${EXPECT_KERNEL}~${EXPECT_KHASH}"; exit 1; }
           for m in kmod tools; do
-            grep -Eq "arch: *${EXPECT_ARCH}" "../out/${m}-meta.txt" || { echo "${m}: архитектура не ${EXPECT_ARCH}"; exit 1; }
+            grep -Eqx " *arch: *${EXPECT_ARCH}" "../out/${m}-meta.txt" || { echo "${m}: архитектура не ${EXPECT_ARCH}"; exit 1; }
           done
-          grep -Eq "version: *${KMOD_VER//./\\.}" ../out/kmod-meta.txt || { echo "kmod: версия не ${KMOD_VER}"; exit 1; }
-          grep -Eq "version: *${TOOLS_VER//./\\.}" ../out/tools-meta.txt || { echo "tools: версия не ${TOOLS_VER}"; exit 1; }
+          # версия kmod в OpenWrt = <версия ядра>.<PKG_VERSION>-r<N> (пример: 6.12.112.3.1.20261113.02-r1)
+          grep -Eqx " *version: *${KRE}\.${KMOD_VER//./\\.}-r[0-9]+" ../out/kmod-meta.txt || { echo "kmod: версия не ${EXPECT_KERNEL}.${KMOD_VER}-rN"; exit 1; }
+          grep -Eqx " *version: *${TOOLS_VER//./\\.}-r[0-9]+" ../out/tools-meta.txt || { echo "tools: версия не ${TOOLS_VER}-rN"; exit 1; }
           mkdir x && "$APK" extract --allow-untrusted --destination x "$K"
-          KO=$(find x -name 'amneziawg.ko'); [ -n "$KO" ] || { echo "нет amneziawg.ko"; exit 1; }
+          KO=$(find x -type f -name 'amneziawg.ko')
+          [ "$(printf '%s\n' "$KO" | grep -c .)" -eq 1 ] || { echo "ожидался ровно один amneziawg.ko, найдено: ${KO:-ничего}"; exit 1; }
+          case "$KO" in */lib/modules/"${EXPECT_KERNEL}"/amneziawg.ko) ;; *) echo "amneziawg.ko не в lib/modules/${EXPECT_KERNEL}: $KO"; exit 1 ;; esac
           file "$KO" > ../out/ko-file.txt; cat ../out/ko-file.txt; grep -q 'ARM aarch64' ../out/ko-file.txt
           VM=$(strings "$KO" | sed -n 's/^vermagic=//p' | head -1); echo "vermagic=$VM" > ../out/ko-vermagic.txt; cat ../out/ko-vermagic.txt
           case "$VM" in "${EXPECT_KERNEL} "*) ;; *) echo "vermagic не ${EXPECT_KERNEL}"; exit 1 ;; esac
+          ( cd "$(dirname "$KO")" && sha256sum amneziawg.ko ) > ../out/ko-sha256.txt; cat ../out/ko-sha256.txt
+          KOSUM=$(cut -d' ' -f1 ../out/ko-sha256.txt)
+          # хеш файла в метаданных apk (paths → amneziawg.ko → hash) должен совпасть с фактическим;
+          # поиск только внутри записи amneziawg.ko: до следующего «name:» или строки без отступа
+          awk '/^ *- name: amneziawg\.ko$/{f=1;next} f&&(/^ *(- )?name:/||/^[^ ]/){exit} f&&/^ *hash: /{print $2;exit}' ../out/kmod-meta.txt | grep -qx "$KOSUM" || { echo "SHA-256 amneziawg.ko не совпадает с метаданными пакета"; exit 1; }
+          # версии инструментов сборки — для BUILDINFO
+          XGCC=$(find staging_dir -path 'staging_dir/toolchain-*/bin/*-openwrt-linux-musl-gcc' \( -type f -o -type l \))
+          [ "$(printf '%s\n' "$XGCC" | grep -c .)" -eq 1 ] || { echo "ожидался ровно один кросс-компилятор, найдено: ${XGCC:-ничего}"; exit 1; }
+          {
+            echo "target gcc: $("$XGCC" --version | head -1)"
+            echo "host gcc: $(gcc --version | head -1)"
+            echo "make: $(make --version | head -1)"
+            echo "openssl: $(openssl version)"
+            echo "apk: $("$APK" --version | head -1)"
+          } > ../out/tools-versions.txt; cat ../out/tools-versions.txt
           mkdir y && "$APK" extract --allow-untrusted --destination y "$T"
           for f in usr/bin/awg usr/bin/amneziawg_watchdog lib/netifd/proto/amneziawg.sh; do
             [ -f "y/$f" ] || { echo "в пакете утилит нет /$f"; exit 1; }
@@ -162,6 +182,8 @@ jobs:
             echo "tools ${TOOLS_REPO} ${TOOLS_VER} ${TOOLS_SHA}"
             echo "expected kernel ${EXPECT_KERNEL} hash ${EXPECT_KHASH}, arch ${EXPECT_ARCH}; ko $(cat ko-vermagic.txt)"
             echo "runner image ${ImageVersion:-?}"
+            cat tools-versions.txt
+            echo "ko sha256 $(cut -d' ' -f1 ko-sha256.txt)"
             echo "run ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           } > BUILDINFO.txt
           sha256sum *.apk > SHA256SUMS
@@ -174,4 +196,4 @@ jobs:
           TAG="awg-${KMOD_VER}-owrt-${OWRT_VER}-run${GITHUB_RUN_ID}"
           cd out
           gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --notes-file BUILDINFO.txt \
-            *.apk SHA256SUMS BUILDINFO.txt kmod-meta.txt tools-meta.txt tools-files.txt ko-file.txt ko-vermagic.txt awg-file.txt feeds.conf.default feeds-revs.txt
+            *.apk SHA256SUMS BUILDINFO.txt kmod-meta.txt tools-meta.txt tools-files.txt ko-file.txt ko-vermagic.txt ko-sha256.txt awg-file.txt tools-versions.txt feeds.conf.default feeds-revs.txt
