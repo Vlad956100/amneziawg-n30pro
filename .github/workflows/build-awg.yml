@@ -1,4 +1,4 @@
-# geovpn-stage1b-v3: сборка AmneziaWG для N30 Pro (PG33N30P), OpenWrt 25.12.6 mediatek/filogic.
+# geovpn-stage1b-v4: сборка AmneziaWG для N30 Pro (PG33N30P), OpenWrt 25.12.6 mediatek/filogic.
 # Файл кладётся в репозиторий как .github/workflows/build-awg.yml. Запуск — вручную (Actions → Run workflow).
 # Сторонних actions нет: всё делается командами на раннере; результат публикуется через gh (GITHUB_TOKEN).
 # Исходники: модуль и утилиты — официальные репозитории amnezia-vpn, закреплены SHA коммитов;
@@ -22,8 +22,11 @@ env:
   EXPECT_KERNEL: "6.12.112"
   EXPECT_KHASH: "f0a7348f9cb959e1bf4d0447669b031e"   # vermagic-хеш ядра роутера (путь kmods на роутере)
   EXPECT_ARCH: "aarch64_cortex-a53"
-  # Открытый ключ выпуска OpenWrt 25.12 — скопирован с роутера (/etc/apk/keys/openwrt-25.12.pem), SHA-256 файла с роутера:
-  OWRT_KEY_SHA256: "27d61d827d64ccf2f46dce5f52aec6279404d4a00686dafb22f52f3b4ee675f8"
+  # Открытый ключ usign, которым подписан sha256sums выпуска 25.12.6 (id b5043e70f9a75cde из sha256sums.sig).
+  # Источник: официальный репозиторий ключей OpenWrt, github.com/openwrt/keyring, коммит fbae29d730f81c892f52e0ff00fe867444aeeae6,
+  # файл usign/b5043e70f9a75cde. SHA-256 встроенного файла ключа:
+  USIGN_KEY_ID: "b5043e70f9a75cde"
+  USIGN_KEY_SHA256: "d7ac10f9ed1b38033855f3d27c9327d558444fca804c685b17d9dcfb0648228f"
   FORK_REPO: "https://github.com/Slava-Shchipunov/awg-openwrt.git"
   FORK_SHA: "03b62269e2edc168504f057cffaafda11b25ed92"   # 2026-09-22 «feat: add awg v3.1 support (#172)»
   KMOD_REPO: "https://github.com/amnezia-vpn/amneziawg-linux-kernel-module.git"
@@ -42,27 +45,43 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends build-essential clang flex bison g++ gawk gettext git \
-            libncurses-dev libssl-dev python3 python3-setuptools rsync swig unzip zlib1g-dev file wget zstd openssl
+            libncurses-dev libssl-dev python3 python3-setuptools python3-cryptography rsync swig unzip zlib1g-dev file wget zstd
           uname -a; lsb_release -a || true; echo "ImageVersion=${ImageVersion:-?}"; gcc --version | head -1
 
-      - name: SDK (подпись sha256sums ключом 25.12 с роутера, имя SDK из sha256sums, проверка SHA-256)
+      - name: SDK (подпись usign на sha256sums, имя SDK из sha256sums, проверка SHA-256)
         run: |
           mkdir -p out
-          cat > owrt-25.12.pem <<'EOF'
-          -----BEGIN PUBLIC KEY-----
-          MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAECqruC4JU7pfpnkQuueBaT29I1dFx
-          Xbc7xYsY5R2+r3Hg3SO3B2QLpMaghA9Uzx/E2PGaNkYe24uPPg/n7Q9Jeg==
-          -----END PUBLIC KEY-----
+          cat > usign.pub <<'EOF'
+          untrusted comment: Public usign key for unattended snapshot builds
+          RWS1BD5w+adc3j2Hqg9+b66CvLR7NlHbsj7wjNVj0XGt/othDgIAOJS+
           EOF
-          sed -i 's/^ *//' owrt-25.12.pem
-          echo "${OWRT_KEY_SHA256}  owrt-25.12.pem" | sha256sum -c -
+          sed -i 's/^ *//' usign.pub
+          echo "${USIGN_KEY_SHA256}  usign.pub" | sha256sum -c -
+          # Проверка подписи usign (Ed25519): формат ключа/подписи, совпадение id, подпись над файлом целиком
+          cat > usign_verify.py <<'EOF'
+          import base64, sys
+          from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+          def b64line(path):
+              lines = [l.strip() for l in open(path, encoding='ascii') if l.strip()]
+              if len(lines) != 2 or not lines[0].startswith('untrusted comment:'):
+                  sys.exit(f'{path}: неверный формат')
+              return base64.b64decode(lines[1], validate=True)
+          pk = b64line(sys.argv[1]); sg = b64line(sys.argv[2]); msg = open(sys.argv[3], 'rb').read()
+          if len(pk) != 42 or pk[:2] != b'Ed': sys.exit('ключ: неверная длина/алгоритм')
+          if len(sg) != 74 or sg[:2] != b'Ed': sys.exit('подпись: неверная длина/алгоритм')
+          if pk[2:10].hex() != sys.argv[4]: sys.exit(f'id ключа {pk[2:10].hex()} != ожидаемого {sys.argv[4]}')
+          if pk[2:10] != sg[2:10]: sys.exit(f'id ключа подписи {sg[2:10].hex()} != id ключа {pk[2:10].hex()}')
+          Ed25519PublicKey.from_public_bytes(pk[10:]).verify(sg[10:], msg)
+          print(f'usign: подпись верна, ключ {pk[2:10].hex()}')
+          EOF
+          sed -i 's/^          //' usign_verify.py
           BASE="https://downloads.openwrt.org/releases/${OWRT_VER}/targets/${TARGET}/${SUBTARGET}"
           curl -fsS --proto '=https' --tlsv1.2 -o sha256sums "$BASE/sha256sums"
           curl -fsS --proto '=https' --tlsv1.2 -o sha256sums.sig "$BASE/sha256sums.sig"
-          if openssl dgst -sha256 -verify owrt-25.12.pem -signature sha256sums.sig sha256sums; then
-            echo "SIG=sha256sums.sig проверена ключом 25.12 (OK)" | tee -a "$GITHUB_ENV"
+          if python3 usign_verify.py usign.pub sha256sums.sig sha256sums "$USIGN_KEY_ID"; then
+            echo "SIG=sha256sums.sig: usign ${USIGN_KEY_ID} OK" | tee -a "$GITHUB_ENV"
           else
-            echo "ПОДПИСЬ sha256sums НЕ ПОДТВЕРЖДЕНА — сборка остановлена"; ls -l sha256sums.sig; od -An -tx1 -N 32 sha256sums.sig; exit 1
+            echo "ПОДПИСЬ sha256sums НЕ ПОДТВЕРЖДЕНА — сборка остановлена"; cat sha256sums.sig; exit 1
           fi
           grep -E ' \*openwrt-sdk-[^ ]+\.Linux-x86_64\.tar\.zst$' sha256sums > sdk.sum
           n=$(wc -l < sdk.sum); [ "$n" -eq 1 ] || { echo "ожидалась ровно одна строка SDK, найдено $n"; cat sdk.sum; exit 1; }
